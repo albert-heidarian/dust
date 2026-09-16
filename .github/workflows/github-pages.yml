@@ -15,9 +15,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Prepare deployment
+        run: |
+          mkdir -p _site
+          cp -r dust.tt/* _site/
+          ls -la _site/
+
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./dust.tt
-          publish_branch: gh-pages
+          publish_dir: ./_site
