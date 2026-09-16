@@ -1,0 +1,35 @@
+{
+  "users": [
+    {
+      "id": 1,
+      "name": "John Doe",
+      "email": "john@example.com",
+      "role": "admin"
+    },
+    {
+      "id": 2,
+      "name": "Jane Smith",
+      "email": "jane@example.com",
+      "role": "user"
+    }
+  ],
+  "products": [
+    {
+      "id": 1,
+      "name": "AI Assistant",
+      "price": 99.99,
+      "description": "Advanced AI assistant for productivity"
+    },
+    {
+      "id": 2,
+      "name": "Data Analytics",
+      "price": 149.99,
+      "description": "Comprehensive data analytics platform"
+    }
+  ],
+  "settings": {
+    "appName": "Dust Backend",
+    "version": "1.0.0",
+    "maintenance": false
+  }
+}

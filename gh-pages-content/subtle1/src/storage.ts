@@ -1,0 +1,674 @@
+import { extend } from '@posthog/browser-common/utils/general-utils'
+import { PersistentStore, Properties } from './types'
+import {
+    DEVICE_ID,
+    DISTINCT_ID,
+    ENABLED_FEATURE_FLAGS,
+    ENABLE_PERSON_PROCESSING,
+    FLAG_CALL_REPORTED,
+    GROUPS,
+    INITIAL_PERSON_INFO,
+    PERSISTENCE_FACEBOOK_CLICK_ID,
+    PERSISTENCE_ACTIVE_FEATURE_FLAGS,
+    PERSISTENCE_FEATURE_FLAG_DETAILS,
+    PERSISTENCE_FEATURE_FLAG_ERRORS,
+    PERSISTENCE_FEATURE_FLAG_EVALUATED_AT,
+    PERSISTENCE_FEATURE_FLAG_PAYLOADS,
+    PERSISTENCE_FEATURE_FLAG_REQUEST_ID,
+    SESSION_ID,
+    SESSION_RECORDING_IS_SAMPLED,
+    STORED_GROUP_PROPERTIES_KEY,
+    STORED_PERSON_PROPERTIES_KEY,
+    USER_STATE,
+    USER_STATE_ANONYMOUS,
+    USER_STATE_IDENTIFIED,
+} from './constants'
+
+import { isArray, isNull, isObject, isUndefined } from '@posthog/core'
+import { logger } from '@posthog/browser-common/utils/logger'
+import { window, document } from '@posthog/browser-common/utils/globals'
+import { getCookieValue } from '@posthog/browser-common/utils/cookie-utils'
+import { uuidv7 } from '@posthog/browser-common/utils/uuidv7'
+
+// we store the discovered subdomain in memory because it might be read multiple times
+let firstNonPublicSubDomain = ''
+
+// helper to allow tests to clear this "cache"
+export const resetSubDomainCache = () => {
+    firstNonPublicSubDomain = ''
+}
+
+/**
+ * Browsers don't offer a way to check if something is a public suffix
+ * e.g. `.com.au`, `.io`, `.org.uk`
+ *
+ * But they do reject cookies set on public suffixes
+ * Setting a cookie on `.co.uk` would mean it was sent for every `.co.uk` site visited
+ *
+ * So, we can use this to check if a domain is a public suffix
+ * by trying to set a cookie on a subdomain of the provided hostname
+ * until the browser accepts it
+ *
+ * inspired by https://github.com/AngusFu/browser-root-domain
+ */
+export function seekFirstNonPublicSubDomain(hostname: string, cookieJar = document): string {
+    if (firstNonPublicSubDomain) {
+        return firstNonPublicSubDomain
+    }
+
+    if (!cookieJar) {
+        return ''
+    }
+    if (['localhost', '127.0.0.1'].includes(hostname)) return ''
+
+    const list = hostname.split('.')
+    let len = Math.min(list.length, 8) // paranoia - we know this number should be small
+    const key = 'dmn_chk_' + uuidv7()
+
+    while (!firstNonPublicSubDomain && len--) {
+        const candidate = list.slice(len).join('.')
+        const candidateCookieValue = key + '=1;domain=.' + candidate + ';path=/'
+
+        // try to set cookie, include a short expiry in seconds since we'll check immediately
+        cookieJar.cookie = candidateCookieValue + ';max-age=3'
+
+        if (cookieJar.cookie.includes(key)) {
+            // the cookie was accepted by the browser, remove the test cookie
+            cookieJar.cookie = candidateCookieValue + ';max-age=0'
+            firstNonPublicSubDomain = candidate
+        }
+    }
+
+    return firstNonPublicSubDomain
+}
+
+const DOMAIN_MATCH_REGEX = /[a-z0-9][a-z0-9-]+\.[a-z]{2,}$/i
+const originalCookieDomainFn = (hostname: string): string => {
+    const matches = hostname.match(DOMAIN_MATCH_REGEX)
+    return matches ? matches[0] : ''
+}
+
+export function chooseCookieDomain(hostname: string, cross_subdomain: boolean | undefined): string {
+    if (cross_subdomain) {
+        // NOTE: Could we use this for cross domain tracking?
+        let matchedSubDomain = seekFirstNonPublicSubDomain(hostname)
+
+        if (!matchedSubDomain) {
+            const originalMatch = originalCookieDomainFn(hostname)
+            if (originalMatch !== matchedSubDomain) {
+                logger.info('Warning: cookie subdomain discovery mismatch', originalMatch, matchedSubDomain)
+            }
+            matchedSubDomain = originalMatch
+        }
+
+        return matchedSubDomain ? '; domain=.' + matchedSubDomain : ''
+    }
+    return ''
+}
+
+let cookieStorageSupported: boolean | null = null
+// helper to allow tests to clear this "cache"
+export const resetCookieStorageSupported = () => {
+    cookieStorageSupported = null
+}
+
+// Methods partially borrowed from quirksmode.org/js/cookies.html
+export const cookieStore: PersistentStore = {
+    _is_supported: function () {
+        if (!isNull(cookieStorageSupported)) {
+            return cookieStorageSupported
+        }
+        // `document` existing is not enough: a page served from a `data:` URL has a
+        // document but reading or writing `document.cookie` throws, and some embedded
+        // contexts silently drop every cookie. Round-trip a probe cookie instead, the
+        // same way localStore and sessionStore establish support.
+        cookieStorageSupported = false
+        if (document) {
+            try {
+                const key = `__ph_cookie_support_${uuidv7()}`
+                cookieStore._set(key, 'xyz')
+                cookieStorageSupported = getCookieValue(key) === '"xyz"'
+                cookieStore._remove(key)
+            } catch {
+                cookieStorageSupported = false
+            }
+        }
+        return cookieStorageSupported
+    },
+
+    _error: function (msg) {
+        logger.error('cookieStore error: ' + msg)
+    },
+
+    _get: getCookieValue,
+
+    _parse: function (name) {
+        let cookie
+        try {
+            cookie = JSON.parse(cookieStore._get(name)) || {}
+        } catch {
+            // noop
+        }
+        return cookie
+    },
+
+    _set: function (name, value, days, cross_subdomain, is_secure) {
+        if (!document) {
+            return false
+        }
+        try {
+            let expires = '',
+                secure = ''
+
+            const cdomain = chooseCookieDomain(document.location.hostname, cross_subdomain)
+
+            if (days) {
+                const date = new Date()
+                date.setTime(date.getTime() + days * 24 * 60 * 60 * 1000)
+                expires = '; expires=' + date.toUTCString()
+            }
+
+            if (is_secure) {
+                secure = '; secure'
+            }
+
+            const new_cookie_val =
+                name +
+                '=' +
+                encodeURIComponent(JSON.stringify(value)) +
+                expires +
+                '; SameSite=Lax; path=/' +
+                cdomain +
+                secure
+
+            // 4096 bytes is the size at which some browsers (e.g. firefox) will not store a cookie, warn slightly before that
+            if (new_cookie_val.length > 4096 * 0.9) {
+                logger.warn('cookieStore warning: large cookie, len=' + new_cookie_val.length)
+            }
+
+            document.cookie = new_cookie_val
+            return true
+        } catch {
+            return false
+        }
+    },
+
+    _remove: function (name, cross_subdomain) {
+        if (!document?.cookie) {
+            return
+        }
+        try {
+            cookieStore._set(name, '', -1, cross_subdomain)
+        } catch {
+            return
+        }
+    },
+}
+
+let _localStorage_supported: boolean | null = null
+export const resetLocalStorageSupported = () => {
+    _localStorage_supported = null
+}
+
+export const localStore: PersistentStore = {
+    _is_supported: function () {
+        if (!isNull(_localStorage_supported)) {
+            return _localStorage_supported
+        }
+
+        let supported = true
+        if (!isUndefined(window)) {
+            try {
+                const key = '__mplssupport__',
+                    val = 'xyz'
+                localStore._set(key, val)
+                if (localStore._get(key) !== '"xyz"') {
+                    supported = false
+                }
+                localStore._remove(key)
+            } catch {
+                supported = false
+            }
+        } else {
+            supported = false
+        }
+        if (!supported) {
+            logger.error('localStorage unsupported; falling back to cookie store')
+        }
+
+        _localStorage_supported = supported
+        return supported
+    },
+
+    _error: function (msg) {
+        logger.error('localStorage error: ' + msg)
+    },
+
+    _get: function (name) {
+        try {
+            return window?.localStorage.getItem(name)
+        } catch (err) {
+            localStore._error(err)
+        }
+        return null
+    },
+
+    _parse: function (name) {
+        try {
+            return JSON.parse(localStore._get(name)) || {}
+        } catch {
+            // noop
+        }
+        return null
+    },
+
+    _set: function (name, value) {
+        try {
+            window?.localStorage.setItem(name, JSON.stringify(value))
+            return true
+        } catch (err) {
+            localStore._error(err)
+        }
+        return false
+    },
+
+    _remove: function (name) {
+        try {
+            window?.localStorage.removeItem(name)
+        } catch (err) {
+            localStore._error(err)
+        }
+    },
+}
+
+// Use localstorage for most data but still use cookie for COOKIE_PERSISTED_PROPERTIES
+// This solves issues with cookies having too much data in them causing headers too large
+// Also makes sure we don't have to send a ton of data to the server
+export const COOKIE_IDENTITY_BOUND_LOCAL_PROPERTIES = [
+    STORED_PERSON_PROPERTIES_KEY,
+    PERSISTENCE_ACTIVE_FEATURE_FLAGS,
+    ENABLED_FEATURE_FLAGS,
+    PERSISTENCE_FEATURE_FLAG_DETAILS,
+    PERSISTENCE_FEATURE_FLAG_PAYLOADS,
+    PERSISTENCE_FEATURE_FLAG_REQUEST_ID,
+    PERSISTENCE_FEATURE_FLAG_EVALUATED_AT,
+    PERSISTENCE_FEATURE_FLAG_ERRORS,
+    FLAG_CALL_REPORTED,
+]
+
+export const COOKIE_PERSISTED_PROPERTIES = [
+    DEVICE_ID,
+    DISTINCT_ID,
+    SESSION_ID,
+    SESSION_RECORDING_IS_SAMPLED,
+    ENABLE_PERSON_PROCESSING,
+    INITIAL_PERSON_INFO,
+    PERSISTENCE_FACEBOOK_CLICK_ID,
+    USER_STATE,
+]
+
+// Snapshot metadata lives in a separate cookie so older SDKs cannot merge it
+// into event-visible persistence. Besides custom-key authority, its presence
+// distinguishes current writers (which preserve falsy values) from legacy writers
+// that omitted them. The payload is tied to the exact main-cookie snapshot;
+// mixed-version or concurrent writes invalidate stale removal semantics.
+const COOKIE_PERSISTED_PROPERTIES_METADATA_SUFFIX = '_cpm'
+
+export const getCookiePersistedPropertiesMetadataName = (name: string): string =>
+    name + COOKIE_PERSISTED_PROPERTIES_METADATA_SUFFIX
+
+const UNSAFE_COOKIE_PROPERTY_KEYS = ['__proto__', 'constructor', 'prototype']
+
+export const getSafeCookieProperties = (value: unknown): Properties => {
+    if (!isObject(value)) {
+        return {}
+    }
+    const safeProperties: Properties = {}
+    Object.keys(value).forEach((key) => {
+        if (UNSAFE_COOKIE_PROPERTY_KEYS.indexOf(key) === -1) {
+            safeProperties[key] = value[key]
+        }
+    })
+    return safeProperties
+}
+
+export const getCookiePersistedProperties = (
+    value: Properties,
+    customCookieProperties: readonly string[] = []
+): Properties => {
+    const cookiePersistedProperties: Properties = {}
+    ;[...COOKIE_PERSISTED_PROPERTIES, ...customCookieProperties].forEach((key) => {
+        const persistedValue = value[key]
+        if (!isUndefined(persistedValue) && !isNull(persistedValue) && persistedValue !== '') {
+            cookiePersistedProperties[key] = persistedValue
+        }
+    })
+    return cookiePersistedProperties
+}
+
+const getCookieSnapshotFingerprint = (cookieValue: string): string => {
+    // Two independent 32-bit hashes plus the byte length keep the sidecar
+    // compact even when the main cookie is close to its 4 KB limit.
+    let first = 5381
+    let second = 2166136261
+    for (let i = 0; i < cookieValue.length; i++) {
+        const code = cookieValue.charCodeAt(i)
+        first = (first * 33) ^ code
+        second = Math.imul(second ^ code, 16777619)
+    }
+    return cookieValue.length.toString(36) + '.' + (first >>> 0).toString(36) + '.' + (second >>> 0).toString(36)
+}
+
+export const getCookiePersistedPropertiesMetadata = (
+    cookieProperties: Properties,
+    customCookieProperties: readonly string[]
+): Properties => ({
+    p: customCookieProperties,
+    f: getCookieSnapshotFingerprint(JSON.stringify(cookieProperties)),
+})
+
+export const getCookiePersistedPropertiesMetadataState = (
+    name: string,
+    cookieValue: string | undefined
+): { properties: readonly string[]; isValid: boolean } => {
+    if (!cookieValue) {
+        return { properties: [], isValid: false }
+    }
+    try {
+        const metadata = cookieStore._parse(getCookiePersistedPropertiesMetadataName(name))
+        const isValid = metadata?.f === getCookieSnapshotFingerprint(cookieValue) && isArray(metadata.p)
+        return { properties: isValid ? metadata.p : [], isValid }
+    } catch {
+        return { properties: [], isValid: false }
+    }
+}
+
+export const getCookiePersistedPropertiesFromMetadata = (
+    name: string,
+    cookieValue: string | undefined
+): readonly string[] => getCookiePersistedPropertiesMetadataState(name, cookieValue).properties
+
+export const getCookiePropertiesFingerprint = (name: string, cookieValue: string): string =>
+    cookieValue + '|' + (cookieStore._get(getCookiePersistedPropertiesMetadataName(name)) || '')
+
+/**
+ * Creates a localPlusCookieStore instance with custom cookie-persisted properties.
+ *
+ * When `preferCookieOnConflict` is true, the cookie's values win over localStorage on
+ * merge for any key both stores carry. Null/empty cookie values are filtered out
+ * before the merge so a malformed legacy cookie cannot override valid localStorage
+ * data. localStorage-only keys are unaffected. See the docs for
+ * `cookieWinsOnConflict` for context.
+ */
+export const createLocalPlusCookieStore = (
+    customCookieProperties: readonly string[] = [],
+    preferCookieOnConflict: boolean = false
+): PersistentStore => {
+    const cookiePropertiesToPersist = [...COOKIE_PERSISTED_PROPERTIES, ...customCookieProperties]
+
+    return {
+        ...localStore,
+        _parse: function (name) {
+            try {
+                let cookieValue: string | undefined
+                let cookieProperties: Properties = {}
+                try {
+                    // Read the main cookie once so values and metadata validation
+                    // always refer to the same snapshot.
+                    cookieValue = cookieStore._get(name) || undefined
+                    cookieProperties = cookieValue ? getSafeCookieProperties(JSON.parse(cookieValue)) : {}
+                } catch {}
+                const localStorageData: Properties = JSON.parse(localStore._get(name) || '{}')
+                let value: Properties
+                if (preferCookieOnConflict) {
+                    // Built-in keys are stable and authoritative for legacy cookies too.
+                    // Separate metadata adds only custom keys understood by the writer.
+                    const metadataState = getCookiePersistedPropertiesMetadataState(name, cookieValue)
+                    const authoritativeCookieProperties = [...COOKIE_PERSISTED_PROPERTIES, ...metadataState.properties]
+                    // Defensive: skip null / empty-string cookie values so a malformed
+                    // legacy cookie cannot wipe out valid localStorage data.
+                    const safeCookieProperties: Properties = {}
+                    Object.keys(cookieProperties).forEach((key) => {
+                        const v = cookieProperties[key]
+                        if (
+                            !isNull(v) &&
+                            v !== '' &&
+                            (key !== USER_STATE || v === USER_STATE_ANONYMOUS || v === USER_STATE_IDENTIFIED)
+                        ) {
+                            safeCookieProperties[key] = v
+                        }
+                    })
+                    const hasValidCookieIdentity =
+                        DISTINCT_ID in safeCookieProperties ||
+                        safeCookieProperties[USER_STATE] === USER_STATE_ANONYMOUS ||
+                        safeCookieProperties[USER_STATE] === USER_STATE_IDENTIFIED
+                    // A non-empty cookie is the complete shared snapshot for the key
+                    // set understood by its writer. Remove omitted keys so a subdomain
+                    // reopened after reset cannot resurrect prior-user values.
+                    if (Object.keys(safeCookieProperties).length > 0) {
+                        const previousDistinctId = localStorageData[DISTINCT_ID]
+                        const previousUserState = localStorageData[USER_STATE] ?? USER_STATE_ANONYMOUS
+                        cookiePropertiesToPersist.forEach((key) => {
+                            if (
+                                authoritativeCookieProperties.indexOf(key) !== -1 &&
+                                !(key in cookieProperties) &&
+                                (hasValidCookieIdentity || (key !== DISTINCT_ID && key !== USER_STATE))
+                            ) {
+                                const localValue = localStorageData[key]
+                                const legacyFalsyBuiltIn =
+                                    !metadataState.isValid &&
+                                    COOKIE_PERSISTED_PROPERTIES.indexOf(key) !== -1 &&
+                                    (localValue === false || localValue === 0)
+                                if (!legacyFalsyBuiltIn) {
+                                    delete localStorageData[key]
+                                }
+                            }
+                        })
+                        if (
+                            hasValidCookieIdentity &&
+                            !(USER_STATE in cookieProperties) &&
+                            !(USER_STATE in localStorageData)
+                        ) {
+                            localStorageData[USER_STATE] = USER_STATE_ANONYMOUS
+                        }
+                        const nextDistinctId =
+                            DISTINCT_ID in safeCookieProperties
+                                ? safeCookieProperties[DISTINCT_ID]
+                                : localStorageData[DISTINCT_ID]
+                        const nextUserState =
+                            USER_STATE in safeCookieProperties
+                                ? safeCookieProperties[USER_STATE]
+                                : localStorageData[USER_STATE]
+                        if (
+                            hasValidCookieIdentity &&
+                            (nextDistinctId !== previousDistinctId || nextUserState !== previousUserState)
+                        ) {
+                            // Identity-bound local fields are not mirrored into
+                            // the shared cookie. Drop them when the authoritative
+                            // cookie identity differs during initial load, matching
+                            // live reconciliation behavior.
+                            COOKIE_IDENTITY_BOUND_LOCAL_PROPERTIES.forEach((key) => delete localStorageData[key])
+                            if (
+                                safeCookieProperties[USER_STATE] === USER_STATE_IDENTIFIED &&
+                                DISTINCT_ID in safeCookieProperties
+                            ) {
+                                localStorageData.$user_id = safeCookieProperties[DISTINCT_ID]
+                            } else {
+                                delete localStorageData.$user_id
+                            }
+                            if (safeCookieProperties[USER_STATE] !== USER_STATE_IDENTIFIED) {
+                                delete localStorageData[GROUPS]
+                                delete localStorageData[STORED_GROUP_PROPERTIES_KEY]
+                            }
+                            delete localStorageData.__alias
+                        }
+                    }
+                    value = extend(localStorageData, safeCookieProperties)
+                } else {
+                    value = extend(cookieProperties, localStorageData)
+                }
+                localStore._set(name, value)
+                return value
+            } catch {
+                // noop
+            }
+            return null
+        },
+
+        _set: function (name, value, days, cross_subdomain, is_secure, debug) {
+            // The localStorage write is the durable one and reports its own
+            // success. The cookie mirror is best-effort: a cookie failure must
+            // not flip an already-landed localStorage write to `false`, or the
+            // caller would treat the durable entry as un-persisted and re-write
+            // it on every later save.
+            const stored = localStore._set(name, value, undefined, undefined, debug)
+            try {
+                const cookiePersistedProperties = getCookiePersistedProperties(value, customCookieProperties)
+
+                if (Object.keys(cookiePersistedProperties).length) {
+                    if (preferCookieOnConflict) {
+                        const metadataName = getCookiePersistedPropertiesMetadataName(name)
+                        const metadata = getCookiePersistedPropertiesMetadata(
+                            cookiePersistedProperties,
+                            customCookieProperties
+                        )
+                        // Publish and verify metadata before the main snapshot. A
+                        // reader in between sees metadata that does not match the
+                        // old main cookie and conservatively retains custom keys and
+                        // legacy falsy built-ins.
+                        // If the sidecar cannot land, do not publish a main snapshot
+                        // whose omitted custom keys would have ambiguous semantics.
+                        cookieStore._set(metadataName, metadata, days, cross_subdomain, is_secure, debug)
+                        if (cookieStore._get(metadataName) !== JSON.stringify(metadata)) {
+                            // Keep cross-subdomain identity/session propagation even
+                            // when custom-key metadata exceeds cookie limits. With no
+                            // matching sidecar, omitted custom keys are conservatively
+                            // non-authoritative.
+                            cookieStore._remove(metadataName, cross_subdomain)
+                            const builtInCookieProperties = getCookiePersistedProperties(value)
+                            cookieStore._set(name, builtInCookieProperties, days, cross_subdomain, is_secure, debug)
+                            return stored
+                        }
+                    }
+                    cookieStore._set(name, cookiePersistedProperties, days, cross_subdomain, is_secure, debug)
+                }
+            } catch (err) {
+                localStore._error(err)
+            }
+            return stored
+        },
+
+        _remove: function (name, cross_subdomain) {
+            try {
+                window?.localStorage.removeItem(name)
+                cookieStore._remove(name, cross_subdomain)
+                cookieStore._remove(getCookiePersistedPropertiesMetadataName(name), cross_subdomain)
+            } catch (err) {
+                localStore._error(err)
+            }
+        },
+    }
+}
+
+const memoryStorage: Properties = {}
+
+// Storage that only lasts the length of the pageview if we don't want to use cookies
+// NB: reads use an `in` check rather than `||` so a stored falsy value survives.
+// Consent writes `0` to mean "opted out", and returning null for it would read back
+// as "no decision recorded".
+export const memoryStore: PersistentStore = {
+    _is_supported: function () {
+        return true
+    },
+
+    _error: function (msg) {
+        logger.error('memoryStorage error: ' + msg)
+    },
+
+    _get: function (name) {
+        return name in memoryStorage ? memoryStorage[name] : null
+    },
+
+    _parse: function (name) {
+        return name in memoryStorage ? memoryStorage[name] : null
+    },
+
+    _set: function (name, value) {
+        memoryStorage[name] = value
+        return true
+    },
+
+    _remove: function (name) {
+        delete memoryStorage[name]
+    },
+}
+
+let sessionStorageSupported: boolean | null = null
+export const resetSessionStorageSupported = () => {
+    sessionStorageSupported = null
+}
+// Storage that only lasts the length of a tab/window. Survives page refreshes
+export const sessionStore: PersistentStore = {
+    _is_supported: function () {
+        if (!isNull(sessionStorageSupported)) {
+            return sessionStorageSupported
+        }
+        sessionStorageSupported = true
+        if (!isUndefined(window)) {
+            try {
+                const key = '__support__',
+                    val = 'xyz'
+                sessionStore._set(key, val)
+                if (sessionStore._get(key) !== '"xyz"') {
+                    sessionStorageSupported = false
+                }
+                sessionStore._remove(key)
+            } catch {
+                sessionStorageSupported = false
+            }
+        } else {
+            sessionStorageSupported = false
+        }
+        return sessionStorageSupported
+    },
+
+    _error: function (msg) {
+        logger.error('sessionStorage error: ', msg)
+    },
+
+    _get: function (name) {
+        try {
+            return window?.sessionStorage.getItem(name)
+        } catch (err) {
+            sessionStore._error(err)
+        }
+        return null
+    },
+
+    _parse: function (name) {
+        try {
+            return JSON.parse(sessionStore._get(name)) || null
+        } catch {
+            // noop
+        }
+        return null
+    },
+
+    _set: function (name, value) {
+        try {
+            window?.sessionStorage.setItem(name, JSON.stringify(value))
+            return true
+        } catch (err) {
+            sessionStore._error(err)
+        }
+        return false
+    },
+
+    _remove: function (name) {
+        try {
+            window?.sessionStorage.removeItem(name)
+        } catch (err) {
+            sessionStore._error(err)
+        }
+    },
+}

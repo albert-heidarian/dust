@@ -1,0 +1,100 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build output
+dist/
+build/
+.next/
+
+# Temporary files
+tmp/
+temp/
+
+# Exclude all external crawled directories
+challenges.cloudflare.com/
+analytics.twitter.com/
+api-eu1.hubapi.com/
+api.vector.co/
+app.dust.tt/
+auth-api.dust.tt/
+avatars.githubusercontent.com/
+browser.sentry-cdn.com/
+bzrcdn.openai.com/
+ca.slack-edge.com/
+cdn.cr-relay.com/
+cdn.vector.co/
+connect.facebook.net/
+cta-eu1.hubspot.com/
+distillery.wistia.com/
+embed-cloudfront.wistia.com/
+embed-ssl.wistia.com/
+fast.wistia.com/
+fast.wistia.net/
+fonts.gstatic.com/
+forms-eu1.hscollectedforms.net/
+forms-eu1.hsforms.com/
+googleads.g.doubleclick.net/
+hagen.challenges.cloudflare.com/
+i.ytimg.com/
+images.ctfassets.net/
+jnn-pa.googleapis.com/
+js-eu1.hs-analytics.net/
+js-eu1.hs-banner.com/
+js-eu1.hs-scripts.com/
+js-eu1.hsadspixel.net/
+js-eu1.hscollectedforms.net/
+js-eu1.hubspot.com/
+manifest.googlevideo.com/
+perf-eu1.hsforms.com/
+pipedream.wistia.com/
+px.ads.linkedin.com/
+px4.ads.linkedin.com/
+region1.google-analytics.com/
+signin.dust.tt/
+snap.licdn.com/
+static.ads-twitter.com/
+static.claydar.com/
+static.doubleclick.net/
+t.co/
+track-eu1.hubspot.com/
+viz.dust.tt/
+wasm---wasm/
+webpack---/
+www.datadoghq-browser-agent.com/
+www.google.com/
+www.googletagmanager.com/
+www.gstatic.com/
+www.youtube.com/
+yt3.ggpht.com/
+bpm---/
+_DataURI/
