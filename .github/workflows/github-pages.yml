@@ -19,7 +19,10 @@ jobs:
         run: |
           mkdir -p _site
           cp -r dust.tt/* _site/
-          ls -la _site/
+          # Remove problematic external directories
+          cd _site
+          rm -rf challenges.cloudflare.com manifest.googlevideo.com analytics.twitter.com api-eu1.hubapi.com api.vector.co app.dust.tt auth-api.dust.tt avatars.githubusercontent.com browser.sentry-cdn.com bzrcdn.openai.com ca.slack-edge.com cdn.cr-relay.com cdn.vector.co connect.facebook.net cta-eu1.hubspot.com distillery.wistia.com embed-cloudfront.wistia.com embed-ssl.wistia.com fast.wistia.com fast.wistia.net fonts.gstatic.com forms-eu1.hscollectedforms.net forms-eu1.hsforms.com googleads.g.doubleclick.net hagen.challenges.cloudflare.com i.ytimg.com images.ctfassets.net jnn-pa.googleapis.com js-eu1.hs-analytics.net js-eu1.hs-banner.com js-eu1.hs-scripts.com js-eu1.hsadspixel.net js-eu1.hscollectedforms.net js-eu1.hubspot.com perf-eu1.hsforms.com pipedream.wistia.com px.ads.linkedin.com px4.ads.linkedin.com region1.google-analytics.com signin.dust.tt snap.licdn.com static.ads-twitter.com static.claydar.com static.doubleclick.net t.co track-eu1.hubspot.com viz.dust.tt wasm---wasm webpack--- www.datadoghq-browser-agent.com www.google.com www.googletagmanager.com www.gstatic.com www.youtube.com yt3.ggpht.com bpm--- _DataURI
+          ls -la
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
